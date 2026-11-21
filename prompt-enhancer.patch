@@ -1,0 +1,1076 @@
+--- a/packages/app/src/composer/model.ts
++++ b/packages/app/src/composer/model.ts
+@@ -16,6 +16,7 @@
+ import { useWorkspaceLocation } from "@/workspaces/location"
+ import { useData, useServer } from "@/runtime/server/current"
+ import { useServerSDK } from "@/runtime/server/client"
++import { normalizeAgentList } from "@/runtime/server/global-sync/utils"
+ import { readLocalImage } from "@/runtime/server/image"
+ import { showToast } from "@/shell/notifications/toast"
+ import { formatServerError } from "@/runtime/server/errors"
+@@ -27,7 +28,7 @@
+ import { rankSessionTitle } from "./session-match"
+ import { useTabs } from "@/shell/tabs/tabs"
+ import type { ComposerAdapter, ComposerControls, ComposerQueue } from "./adapter"
+-import { isAttachment } from "./prompt-parts"
++import { clonePrompt, isAttachment } from "./prompt-parts"
+ import { isCommentItem } from "./state"
+ import type { PromptHistoryComment } from "./history/entry"
+ import { createComposerHistory } from "./history/store"
+@@ -35,6 +36,17 @@
+ import { composerSubmitView } from "./machine"
+ import { useAttachmentDestination } from "./attachments/destination"
+ import { parseClientSlashCommand } from "./client-slash-command"
++import {
++  activePromptEnhancerProfile,
++  buildEnhancementPrompt,
++  cleanEnhancedText,
++  isEnhanceableText,
++  promptEnhancerSettings,
++  promptEnhancing,
++  rebuildPrompt,
++  setPromptEnhancing,
++} from "./enhance"
++import { showPromptEnhancePreview } from "./enhance-dialog"
+ 
+ export type ComposerModel = ComposerEditorModel & {
+   readonly model: ComposerControls["model"]
+@@ -76,8 +88,10 @@
+   // A path attachment's image is read through the server, which can see both local and uploaded paths.
+   const pathImages = new Map<string, Promise<string | undefined>>()
+   const pathImageReads = new AbortController()
++  let enhancementAbort: AbortController | undefined
+   onCleanup(() => {
+     abort(pathImageReads)
++    enhancementAbort?.abort()
+     pathImages.forEach((url) => void url.then((value) => value && URL.revokeObjectURL(value)))
+   })
+ 
+@@ -346,6 +360,82 @@
+ 
+   const submitView = createMemo(() => composerSubmitView(submission.state()))
+ 
++  // Enhances the draft before the normal submit path captures it. The original text, attachments,
++  // comments, and mentions stay put until the rewrite is ready or the person confirms it.
++  const enhanceAndSubmit = async (submitOptions?: { alternate?: boolean; first?: boolean }) => {
++    const send = () => submission.submit(new Event("submit"), submitOptions)
++    const settings = promptEnhancerSettings()
++
++    if (!settings.enabled || mode() !== "normal" || blank() || promptEnhancing()) return send()
++
++    const profile = activePromptEnhancerProfile()
++    const draft = clonePrompt(prompt.current())
++    const text = draft.map((part) => ("content" in part ? part.content : "")).join("")
++
++    if (!isEnhanceableText(text)) return send()
++
++    enhancementAbort?.abort()
++    const controller = new AbortController()
++    enhancementAbort = controller
++    setPromptEnhancing(true)
++
++    let enhanced: string
++    try {
++      const current = adapter.controls().model.selection.current()
++      const model =
++        profile.providerID && profile.modelID
++          ? { providerID: profile.providerID, id: profile.modelID }
++          : current
++            ? { providerID: current.provider.id, id: current.id }
++            : undefined
++
++      const agentInfo = profile.agent
++        ? normalizeAgentList(data.location.agent.list({ directory: sdk().directory }) ?? []).find(
++            (item) => item.name === profile.agent,
++          )
++        : undefined
++      const agentContext = agentInfo
++        ? [agentInfo.prompt, agentInfo.description && `Agent purpose: ${agentInfo.description}`]
++            .filter(Boolean)
++            .join("\n\n")
++        : undefined
++
++      const result = await serverSDK.api.experimental.generate.text(
++        {
++          prompt: buildEnhancementPrompt(text, profile.instructions, agentContext),
++          model,
++        },
++        { signal: controller.signal },
++      )
++      enhanced = cleanEnhancedText(result.text)
++    } catch (error) {
++      if (!controller.signal.aborted)
++        showToast({
++          variant: "error",
++          title: language.t("ui.promptEnhance.failed.title"),
++          description: composerErrorMessage(language, error),
++        })
++
++      return
++    } finally {
++      if (enhancementAbort === controller) enhancementAbort = undefined
++      setPromptEnhancing(false)
++    }
++
++    if (!enhanced || enhanced === text.trim()) return send()
++
++    if (settings.preview) {
++      const choice = await showPromptEnhancePreview(dialog, text, enhanced)
++
++      if (choice === "cancel") return
++      if (choice === "original") return send()
++    }
++
++    prompt.set(rebuildPrompt(draft, enhanced))
++
++    return send()
++  }
++
+   const controller = createComposerEditor({
+     store: prompt.store,
+     history: {
+@@ -567,7 +657,7 @@
+             return
+           }
+ 
+-          void submission.submit(new Event("submit"), submitOptions)
++          void enhanceAndSubmit(submitOptions)
+         },
+         onStop: () => void submission.stop(),
+       },
+--- a/packages/app/src/composer/editor/editor.tsx
++++ b/packages/app/src/composer/editor/editor.tsx
+@@ -59,6 +59,7 @@
+ } from "./machine"
+ import { composerHistoryPreviewHeight, composerPopoverActiveID, isComposerPopoverOpen } from "../suggestions/machine"
+ import { QuoteCommentEditor } from "./quote-comment"
++import { ComposerEnhanceControls } from "./enhance-controls"
+ import { selectQuoteCommentView, type QuoteCommentController } from "../quote-comment-machine"
+ import "../attachments/attachments.css"
+ import "./editor.css"
+@@ -513,6 +514,7 @@
+           <Show when={!touch()}>
+             <div data-slot="composer-actions" class="flex shrink-0 items-center">
+               <Show when={mode() === "normal"}>
++                <ComposerEnhanceControls />
+                 <ComposerEditorAlternateDelivery
+                   controller={props.controller}
+                   keybind={props.alternateKeybind ?? ["Mod", "Enter"]}
+--- a/packages/ui/src/i18n/en.ts
++++ b/packages/ui/src/i18n/en.ts
+@@ -251,6 +251,34 @@
+   "ui.promptInput.queue": "Queue",
+   "ui.promptInput.steerHint": "Send without interrupting",
+ 
++  "ui.promptEnhance.enable": "Enhance",
++  "ui.promptEnhance.enable.tooltip": "Rewrite your prompt with a model before sending",
++  "ui.promptEnhance.preview": "Preview",
++  "ui.promptEnhance.preview.tooltip": "Review the rewritten prompt before it is sent",
++  "ui.promptEnhance.settings": "Prompt enhancement settings",
++  "ui.promptEnhance.title": "Prompt enhancement",
++  "ui.promptEnhance.profile": "Profile",
++  "ui.promptEnhance.profile.name": "Profile name",
++  "ui.promptEnhance.profile.new": "New",
++  "ui.promptEnhance.profile.duplicate": "Duplicate",
++  "ui.promptEnhance.profile.delete": "Delete",
++  "ui.promptEnhance.agent": "Agent",
++  "ui.promptEnhance.agent.none": "No agent",
++  "ui.promptEnhance.model": "Model",
++  "ui.promptEnhance.model.current": "Current composer model",
++  "ui.promptEnhance.model.search": "Search models…",
++  "ui.promptEnhance.model.empty": "No models found",
++  "ui.promptEnhance.instructions": "Enhancement instructions",
++  "ui.promptEnhance.reset": "Restore defaults",
++  "ui.promptEnhance.enhancing": "Enhancing…",
++  "ui.promptEnhance.failed.title": "Prompt enhancement failed",
++  "ui.promptEnhance.preview.title": "Preview enhanced prompt",
++  "ui.promptEnhance.preview.description": "This is what will be sent. Attachments and references are kept.",
++  "ui.promptEnhance.preview.original": "Original",
++  "ui.promptEnhance.preview.enhanced": "Enhanced",
++  "ui.promptEnhance.preview.sendOriginal": "Send original",
++  "ui.promptEnhance.preview.sendEnhanced": "Send enhanced",
++
+   "ui.tabs.close": "Close tab",
+ 
+   "ui.redirectPaste.label": "Redirect URL",
+--- /dev/null
++++ b/packages/app/src/composer/enhance.ts
+@@ -0,0 +1,273 @@
++import { createSignal } from "solid-js"
++import { isAttachment } from "./prompt-parts"
++import type { Prompt } from "./state"
++
++/** One reusable enhancer configuration: a model, an optional agent, and its instructions. */
++export type PromptEnhancerProfile = {
++  id: string
++  name: string
++  /** An OpenCode agent whose system prompt is added as context. */
++  agent?: string
++  /** Explicit model for enhancement. When absent the composer model is used. */
++  providerID?: string
++  modelID?: string
++  /** How the model should rewrite a prompt. */
++  instructions: string
++}
++
++/**
++ * Settings for the prompt enhancer. They live in the renderer's local storage so they survive
++ * reloads without needing a server config round trip; the enhancer is a client-side convenience,
++ * not a project or session setting.
++ */
++export type PromptEnhancerSettings = {
++  enabled: boolean
++  /** Show the rewritten prompt for review before it is sent. */
++  preview: boolean
++  activeProfileID: string
++  profiles: PromptEnhancerProfile[]
++}
++
++export const DEFAULT_ENHANCER_INSTRUCTIONS = `Rewrite the prompt for a coding assistant so it is clear, specific, and easy to act on.
++
++Return only the rewritten prompt. Do not add a preface, labels, quotes, or a code fence.
++
++Rules:
++- Preserve the author's intent, language, and every concrete requirement.
++- Remove filler, repetition, and vague phrasing. Do not invent requirements, files, or facts.
++- Make the goal, relevant context, constraints, and expected outcome explicit.
++- If the request is ambiguous, state a reasonable assumption briefly instead of asking a question.
++- Keep code, commands, paths, URLs, and @mentions exactly as written.`
++
++const STORAGE_KEY = "opencode.prompt-enhancer.v1"
++
++const DEFAULT_PROFILE_ID = "default"
++
++function defaultProfile(): PromptEnhancerProfile {
++  return { id: DEFAULT_PROFILE_ID, name: "Default", instructions: DEFAULT_ENHANCER_INSTRUCTIONS }
++}
++
++function defaults(): PromptEnhancerSettings {
++  return { enabled: false, preview: true, activeProfileID: DEFAULT_PROFILE_ID, profiles: [defaultProfile()] }
++}
++
++function cloneSettings(value: PromptEnhancerSettings): PromptEnhancerSettings {
++  return { ...value, profiles: value.profiles.map((profile) => ({ ...profile })) }
++}
++
++function profileID(value: unknown, fallback: string) {
++  return typeof value === "string" && value.trim() ? value : fallback
++}
++
++function readProfile(value: unknown, index: number): PromptEnhancerProfile | undefined {
++  if (!value || typeof value !== "object") return
++
++  // SAFETY: the stored value is our own JSON; each field is checked before use so older or
++  // hand-edited values cannot break the composer.
++  const profile = value as Record<string, unknown>
++
++  return {
++    id: profileID(profile.id, `profile-${index + 1}`),
++    name:
++      typeof profile.name === "string" && profile.name.trim()
++        ? profile.name
++        : index === 0
++          ? "Default"
++          : `Profile ${index + 1}`,
++    agent: typeof profile.agent === "string" && profile.agent ? profile.agent : undefined,
++    providerID: typeof profile.providerID === "string" ? profile.providerID : undefined,
++    modelID: typeof profile.modelID === "string" ? profile.modelID : undefined,
++    instructions:
++      typeof profile.instructions === "string" && profile.instructions.trim()
++        ? profile.instructions
++        : DEFAULT_ENHANCER_INSTRUCTIONS,
++  }
++}
++
++function readSettings(): PromptEnhancerSettings {
++  if (typeof localStorage === "undefined") return defaults()
++
++  try {
++    const raw = localStorage.getItem(STORAGE_KEY)
++
++    if (!raw) return defaults()
++
++    // SAFETY: the stored value is our own JSON; every field is validated below.
++    const stored = JSON.parse(raw) as Record<string, unknown>
++
++    const profiles = Array.isArray(stored.profiles)
++      ? stored.profiles.map(readProfile).filter((profile): profile is PromptEnhancerProfile => !!profile)
++      : []
++
++    // v1 stored a single model and instruction set at the top level.
++    if (!profiles.length) {
++      const migrated = readProfile(
++        {
++          id: DEFAULT_PROFILE_ID,
++          name: "Default",
++          providerID: stored.providerID,
++          modelID: stored.modelID,
++          instructions: stored.instructions,
++        },
++        0,
++      )
++
++      if (migrated) profiles.push(migrated)
++    }
++
++    if (!profiles.length) return defaults()
++
++    const seen = new Set<string>()
++    profiles.forEach((profile, index) => {
++      if (seen.has(profile.id)) profile.id = `${profile.id}-${index + 1}`
++      seen.add(profile.id)
++    })
++
++    const active = profiles.find((profile) => profile.id === stored.activeProfileID)
++
++    return {
++      enabled: typeof stored.enabled === "boolean" ? stored.enabled : defaults().enabled,
++      preview: typeof stored.preview === "boolean" ? stored.preview : defaults().preview,
++      activeProfileID: active?.id ?? profiles[0]!.id,
++      profiles,
++    }
++  } catch {
++    return defaults()
++  }
++}
++
++const [settings, setSettings] = createSignal<PromptEnhancerSettings>(readSettings())
++
++function persist(next: PromptEnhancerSettings) {
++  const value = cloneSettings(next)
++  setSettings(value)
++
++  try {
++    if (typeof localStorage !== "undefined") localStorage.setItem(STORAGE_KEY, JSON.stringify(value))
++  } catch {
++    // A failed write only loses the preference on the next launch; the open window keeps it.
++  }
++}
++
++export function promptEnhancerSettings() {
++  return settings()
++}
++
++export function activePromptEnhancerProfile(): PromptEnhancerProfile {
++  const current = settings()
++
++  return (
++    current.profiles.find((profile) => profile.id === current.activeProfileID) ??
++    current.profiles[0] ??
++    defaultProfile()
++  )
++}
++
++export function updatePromptEnhancerSettings(patch: Partial<PromptEnhancerSettings>) {
++  persist({ ...settings(), ...patch })
++}
++
++export function defaultPromptEnhancerSettings(): PromptEnhancerSettings {
++  return cloneSettings(defaults())
++}
++
++const [enhancing, setEnhancing] = createSignal(false)
++
++/** Mirrors whether a rewrite is in flight, so the composer can show progress and refuse a second send. */
++export function promptEnhancing() {
++  return enhancing()
++}
++
++export function setPromptEnhancing(value: boolean) {
++  setEnhancing(value)
++}
++
++/** Slash commands, shell input, and empty drafts are sent as-is. */
++export function isEnhanceableText(text: string) {
++  const trimmed = text.trim()
++
++  return trimmed.length > 0 && !trimmed.startsWith("/")
++}
++
++export function buildEnhancementPrompt(
++  text: string,
++  instructions = DEFAULT_ENHANCER_INSTRUCTIONS,
++  agentContext?: string,
++) {
++  const agent = agentContext?.trim()
++
++  return `${agent ? `${agent}\n\n` : ""}${instructions}
++
++Original prompt:
++"""
++${text}
++"""`
++}
++
++/** Models occasionally wrap a rewrite in a fence or quotes despite the instruction. */
++export function cleanEnhancedText(raw: string) {
++  let text = raw.trim()
++
++  const fenced = text.match(/^```(?:[^\n]*)\n([\s\S]*?)\n?```$/)
++
++  if (fenced) text = (fenced[1] ?? text).trim()
++
++  if (
++    text.length >= 2 &&
++    ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) &&
++    !text.slice(1, -1).includes(text[0])
++  )
++    text = text.slice(1, -1).trim()
++
++  return text
++}
++
++type MentionPart = Exclude<Prompt[number], { type: "text" }>
++
++function isMention(part: Prompt[number]): part is Extract<MentionPart, { content: string }> {
++  return !isAttachment(part) && part.type !== "text"
++}
++
++/**
++ * Rebuilds a prompt around a rewritten body while keeping its attachments and references.
++ * Mentions that disappeared from the rewrite are appended, so a referenced file or skill is
++ * still attached to the sent request.
++ */
++export function rebuildPrompt(prompt: Prompt, enhanced: string): Prompt {
++  let text = enhanced.trim()
++  const mentions = prompt.filter(isMention)
++
++  let cursor = 0
++  const placed = mentions.map((part) => {
++    let start = text.indexOf(part.content, cursor)
++
++    if (start < 0) start = text.indexOf(part.content)
++
++    if (start < 0) {
++      text += `${text.length ? " " : ""}${part.content}`
++      start = text.length - part.content.length
++    }
++
++    cursor = start + part.content.length
++
++    return { part, start }
++  })
++
++  const parts: Prompt = []
++  let position = 0
++
++  for (const { part, start } of placed.toSorted((a, b) => a.start - b.start)) {
++    if (start > position) {
++      parts.push({ type: "text", content: text.slice(position, start), start: position, end: start })
++    }
++
++    parts.push({ ...part, start, end: start + part.content.length })
++    position = start + part.content.length
++  }
++
++  if (position < text.length) {
++    parts.push({ type: "text", content: text.slice(position), start: position, end: text.length })
++  }
++
++  return [...parts, ...prompt.filter(isAttachment)]
++}
+--- /dev/null
++++ b/packages/app/src/composer/enhance-dialog.tsx
+@@ -0,0 +1,461 @@
++import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js"
++import { createStore } from "solid-js/store"
++import { Button } from "@opencode/ui/button"
++import { Checkbox } from "@opencode/ui/checkbox"
++import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitleGroup } from "@opencode/ui/dialog"
++import { Icon } from "@opencode/ui/icon"
++import { Select } from "@opencode/ui/select"
++import { Textarea } from "@opencode/ui/textarea"
++import { TextInput } from "@opencode/ui/text-input"
++import { useDialog } from "@opencode/ui/context/dialog"
++import { useModels } from "@/providers/models/models"
++import { useData } from "@/runtime/server/current"
++import { normalizeAgentList } from "@/runtime/server/global-sync/utils"
++import { useLanguage } from "@/runtime/i18n/language"
++import { useWorkspaceLocation } from "@/workspaces/location"
++import {
++  DEFAULT_ENHANCER_INSTRUCTIONS,
++  defaultPromptEnhancerSettings,
++  promptEnhancerSettings,
++  updatePromptEnhancerSettings,
++  type PromptEnhancerProfile,
++  type PromptEnhancerSettings,
++} from "./enhance"
++
++type Option = {
++  id: string
++  label: string
++}
++
++type ModelOption = Option & {
++  providerID?: string
++  modelID?: string
++}
++
++const CURRENT_MODEL: ModelOption = { id: "__current__", label: "" }
++
++const NO_AGENT = ""
++
++function uniqueProfileName(profiles: PromptEnhancerProfile[], base: string) {
++  if (!profiles.some((profile) => profile.name === base)) return base
++
++  let index = 2
++
++  while (profiles.some((profile) => profile.name === `${base} ${index}`)) index += 1
++
++  return `${base} ${index}`
++}
++
++function newProfileID() {
++  return globalThis.crypto?.randomUUID?.() ?? `profile-${Date.now()}`
++}
++
++/** The settings dialog the composer's cog opens. */
++export function DialogPromptEnhanceSettings() {
++  const dialog = useDialog()
++  const language = useLanguage()
++  const models = useModels()
++  const data = useData()
++  const location = useWorkspaceLocation()
++  const [draft, setDraft] = createStore<PromptEnhancerSettings>(structuredClone(promptEnhancerSettings()))
++  const [modelSearch, setModelSearch] = createSignal("")
++  const [modelOpen, setModelOpen] = createSignal(false)
++  let modelPicker: HTMLDivElement | undefined
++
++  onMount(() => {
++    const close = (event: PointerEvent) => {
++      if (!modelOpen()) return
++      if (event.target instanceof Node && modelPicker?.contains(event.target)) return
++
++      setModelOpen(false)
++    }
++
++    document.addEventListener("pointerdown", close)
++    onCleanup(() => document.removeEventListener("pointerdown", close))
++  })
++
++  const profileOptions = createMemo<Option[]>(() =>
++    draft.profiles.map((profile) => ({ id: profile.id, label: profile.name || "Untitled profile" })),
++  )
++
++  const activeProfile = createMemo(
++    () => draft.profiles.find((profile) => profile.id === draft.activeProfileID) ?? draft.profiles[0],
++  )
++
++  const activeIndex = createMemo(() => draft.profiles.findIndex((profile) => profile.id === activeProfile()?.id))
++
++  const editProfile = (patch: Partial<PromptEnhancerProfile>) => {
++    const index = activeIndex()
++
++    if (index < 0) return
++
++    setDraft("profiles", index, (profile) => ({ ...profile, ...patch }))
++  }
++
++  const selectProfile = (option: Option | null) => {
++    if (!option) return
++
++    setDraft("activeProfileID", option.id)
++    setModelSearch("")
++    setModelOpen(false)
++  }
++
++  const addProfile = () => {
++    const profile: PromptEnhancerProfile = {
++      id: newProfileID(),
++      name: uniqueProfileName(draft.profiles, "New profile"),
++      instructions: DEFAULT_ENHANCER_INSTRUCTIONS,
++    }
++
++    setDraft("profiles", draft.profiles.length, profile)
++    setDraft("activeProfileID", profile.id)
++    setModelSearch("")
++    setModelOpen(false)
++  }
++
++  const duplicateProfile = () => {
++    const source = activeProfile()
++
++    if (!source) return
++
++    const copy: PromptEnhancerProfile = {
++      ...source,
++      id: newProfileID(),
++      name: uniqueProfileName(draft.profiles, `${source.name || "Profile"} copy`),
++    }
++
++    setDraft("profiles", draft.profiles.length, copy)
++    setDraft("activeProfileID", copy.id)
++    setModelSearch("")
++    setModelOpen(false)
++  }
++
++  const deleteProfile = () => {
++    if (draft.profiles.length <= 1) return
++    const id = activeProfile()?.id
++    const next = draft.profiles.filter((profile) => profile.id !== id)
++
++    if (!next.length) return
++
++    setDraft("profiles", next)
++    setDraft("activeProfileID", next[0]!.id)
++    setModelSearch("")
++    setModelOpen(false)
++  }
++
++  const agents = createMemo(() =>
++    normalizeAgentList(data.location.agent.list({ directory: location().directory }) ?? []).filter(
++      (agent) => !agent.hidden,
++    ),
++  )
++
++  const agentOptions = createMemo<Option[]>(() => [
++    { id: NO_AGENT, label: language.t("ui.promptEnhance.agent.none") },
++    ...agents().map((agent) => ({ id: agent.name, label: agent.name })),
++  ])
++
++  const currentAgent = createMemo(
++    () => agentOptions().find((option) => option.id === (activeProfile()?.agent ?? NO_AGENT)) ?? agentOptions()[0],
++  )
++
++  const selectAgent = (option: Option | null) => {
++    editProfile({ agent: option?.id || undefined })
++  }
++
++  const modelOptions = createMemo<ModelOption[]>(() => [
++    { ...CURRENT_MODEL, label: language.t("ui.promptEnhance.model.current") },
++    ...models.list().map((model) => ({
++      id: `${model.provider.id}:${model.id}`,
++      providerID: model.provider.id,
++      modelID: model.id,
++      label: `${model.provider.name} · ${model.name}`,
++    })),
++  ])
++
++  const selectedModelID = createMemo(() => {
++    const profile = activeProfile()
++
++    return profile?.providerID && profile.modelID ? `${profile.providerID}:${profile.modelID}` : CURRENT_MODEL.id
++  })
++
++  const selectedModelLabel = createMemo(() => {
++    const profile = activeProfile()
++
++    if (!profile?.providerID || !profile.modelID) return language.t("ui.promptEnhance.model.current")
++
++    const option = modelOptions().find(
++      (item) => item.providerID === profile.providerID && item.modelID === profile.modelID,
++    )
++
++    return option?.label ?? `${profile.providerID} · ${profile.modelID}`
++  })
++
++  const filteredModels = createMemo(() => {
++    const query = modelSearch().trim().toLowerCase()
++
++    if (!query) return modelOptions()
++
++    return modelOptions().filter((option) => `${option.label} ${option.id}`.toLowerCase().includes(query))
++  })
++
++  const selectModel = (option: ModelOption) => {
++    editProfile({ providerID: option.providerID, modelID: option.modelID })
++    setModelOpen(false)
++    setModelSearch("")
++  }
++
++  const save = () => {
++    updatePromptEnhancerSettings({ ...draft })
++    dialog.close()
++  }
++
++  const reset = () => {
++    setDraft(defaultPromptEnhancerSettings())
++    setModelSearch("")
++    setModelOpen(false)
++  }
++
++  return (
++    <Dialog size="large" fit>
++      <DialogHeader closeLabel={language.t("common.close")}>
++        <DialogTitleGroup title={language.t("ui.promptEnhance.title")} />
++      </DialogHeader>
++      <DialogBody class="gap-4 !overflow-y-auto !overflow-x-hidden p-4">
++        <div class="flex flex-col gap-1.5">
++          <div class="text-[12px] font-[500] leading-5 text-v2-text-text-base">
++            {language.t("ui.promptEnhance.profile")}
++          </div>
++          <div class="flex items-center gap-2">
++            <Select
++              options={profileOptions()}
++              current={profileOptions().find((option) => option.id === draft.activeProfileID)}
++              value={(option) => option.id}
++              label={(option) => option.label}
++              onSelect={selectProfile}
++              appearance="base"
++              class="!w-full min-w-0 flex-1"
++              placeholder={language.t("ui.promptEnhance.profile")}
++            />
++            <Button size="small" variant="ghost" class="shrink-0" onClick={addProfile}>
++              {language.t("ui.promptEnhance.profile.new")}
++            </Button>
++            <Button size="small" variant="ghost" class="shrink-0" onClick={duplicateProfile}>
++              {language.t("ui.promptEnhance.profile.duplicate")}
++            </Button>
++            <Button
++              size="small"
++              variant="ghost-danger"
++              class="shrink-0"
++              disabled={draft.profiles.length <= 1}
++              onClick={deleteProfile}
++            >
++              {language.t("ui.promptEnhance.profile.delete")}
++            </Button>
++          </div>
++        </div>
++
++        <div class="flex flex-col gap-1.5">
++          <div class="text-[12px] font-[500] leading-5 text-v2-text-text-base">
++            {language.t("ui.promptEnhance.profile.name")}
++          </div>
++          <TextInput
++            class="!w-full"
++            appearance="base"
++            value={activeProfile()?.name ?? ""}
++            onInput={(event) => editProfile({ name: event.currentTarget.value })}
++          />
++        </div>
++
++        <div class="flex flex-col gap-1.5">
++          <div class="text-[12px] font-[500] leading-5 text-v2-text-text-base">
++            {language.t("ui.promptEnhance.agent")}
++          </div>
++          <Select
++            options={agentOptions()}
++            current={currentAgent()}
++            value={(option) => option.id}
++            label={(option) => option.label}
++            onSelect={selectAgent}
++            appearance="base"
++            class="!w-full"
++            placeholder={language.t("ui.promptEnhance.agent.none")}
++          />
++        </div>
++
++        <div class="flex flex-col gap-1.5">
++          <div class="text-[12px] font-[500] leading-5 text-v2-text-text-base">
++            {language.t("ui.promptEnhance.model")}
++          </div>
++          <div ref={modelPicker} class="flex flex-col gap-1.5">
++            <button
++              type="button"
++              class="flex h-7 w-full items-center justify-between gap-2 rounded-md bg-v2-background-bg-base px-2.5 text-left text-[12px] leading-5 text-v2-text-text-base shadow-[var(--v2-elevation-input)] outline outline-1 -outline-offset-1 outline-transparent hover:bg-v2-overlay-simple-overlay-hover focus-visible:outline-v2-border-border-focus"
++              aria-expanded={modelOpen()}
++              aria-haspopup="listbox"
++              onClick={() => setModelOpen((open) => !open)}
++            >
++              <span class="min-w-0 flex-1 truncate">{selectedModelLabel()}</span>
++              <Icon name="chevron-down" size="small" class="shrink-0 text-v2-text-text-muted" />
++            </button>
++            <Show when={modelOpen()}>
++              <div class="overflow-hidden rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01">
++                <div class="p-1.5">
++                  <TextInput
++                    class="!w-full"
++                    appearance="base"
++                    autofocus
++                    leadingIcon={<Icon name="magnifying-glass" size="small" />}
++                    placeholder={language.t("ui.promptEnhance.model.search")}
++                    value={modelSearch()}
++                    onInput={(event) => setModelSearch(event.currentTarget.value)}
++                    onKeyDown={(event) => {
++                      if (event.key === "Escape") setModelOpen(false)
++                    }}
++                    showClearButton
++                    onClearClick={() => setModelSearch("")}
++                    clearLabel={language.t("common.clear")}
++                  />
++                </div>
++                <div class="max-h-44 overflow-y-auto" role="listbox">
++                  <For each={filteredModels()}>
++                    {(option) => (
++                      <button
++                        type="button"
++                        role="option"
++                        aria-selected={selectedModelID() === option.id}
++                        class="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-v2-overlay-simple-overlay-hover"
++                        onClick={() => selectModel(option)}
++                      >
++                        <span
++                          class="min-w-0 flex-1 truncate text-[12px] leading-5"
++                          classList={{ "text-v2-text-text-base": selectedModelID() === option.id }}
++                        >
++                          {option.label}
++                        </span>
++                        <Show when={selectedModelID() === option.id}>
++                          <Icon name="check" size="small" class="shrink-0 text-v2-text-text-muted" />
++                        </Show>
++                      </button>
++                    )}
++                  </For>
++                  <Show when={filteredModels().length === 0}>
++                    <div class="px-2.5 py-2 text-[11px] leading-4 text-v2-text-text-muted">
++                      {language.t("ui.promptEnhance.model.empty")}
++                    </div>
++                  </Show>
++                </div>
++              </div>
++            </Show>
++          </div>
++        </div>
++
++        <div class="flex flex-col gap-1.5">
++          <div class="text-[12px] font-[500] leading-5 text-v2-text-text-base">
++            {language.t("ui.promptEnhance.instructions")}
++          </div>
++          <Textarea
++            class="!w-full min-h-40 resize overflow-hidden [&_[data-slot=textarea-v2-textarea]]:resize-none"
++            rows={10}
++            surface="layer-1"
++            value={activeProfile()?.instructions ?? ""}
++            spellcheck={false}
++            onInput={(event) => editProfile({ instructions: event.currentTarget.value })}
++          />
++        </div>
++
++        <div class="flex items-center gap-4">
++          <Checkbox appearance="compact" checked={draft.enabled} onChange={(checked) => setDraft("enabled", checked)}>
++            {language.t("ui.promptEnhance.enable")}
++          </Checkbox>
++          <Checkbox appearance="compact" checked={draft.preview} onChange={(checked) => setDraft("preview", checked)}>
++            {language.t("ui.promptEnhance.preview")}
++          </Checkbox>
++        </div>
++      </DialogBody>
++      <DialogFooter>
++        <Button variant="ghost" class="me-auto" onClick={reset}>
++          {language.t("ui.promptEnhance.reset")}
++        </Button>
++        <Button variant="ghost" onClick={() => dialog.close()}>
++          {language.t("common.cancel")}
++        </Button>
++        <Button variant="contrast" onClick={save}>
++          {language.t("common.save")}
++        </Button>
++      </DialogFooter>
++    </Dialog>
++  )
++}
++
++export type EnhancePreviewChoice = "enhanced" | "original" | "cancel"
++
++/** Opens the review dialog and resolves with what the person chose. */
++export function showPromptEnhancePreview(
++  dialog: ReturnType<typeof useDialog>,
++  original: string,
++  enhanced: string,
++): Promise<EnhancePreviewChoice> {
++  return new Promise((resolve) => {
++    let settled = false
++    const finish = (choice: EnhancePreviewChoice) => {
++      if (settled) return
++      settled = true
++      resolve(choice)
++      dialog.close()
++    }
++
++    void dialog.show(
++      () => <DialogPromptEnhancePreview original={original} enhanced={enhanced} onChoose={finish} />,
++      () => finish("cancel"),
++    )
++  })
++}
++
++function DialogPromptEnhancePreview(props: {
++  original: string
++  enhanced: string
++  onChoose: (choice: EnhancePreviewChoice) => void
++}) {
++  const language = useLanguage()
++  const [pane, setPane] = createSignal<"enhanced" | "original">("enhanced")
++
++  return (
++    <Dialog size="large" fit>
++      <DialogHeader closeLabel={language.t("common.close")}>
++        <DialogTitleGroup
++          title={language.t("ui.promptEnhance.preview.title")}
++          description={language.t("ui.promptEnhance.preview.description")}
++        />
++      </DialogHeader>
++      <DialogBody class="gap-3">
++        <div class="flex items-center gap-1.5">
++          <For each={["enhanced", "original"] as const}>
++            {(value) => (
++              <Button size="small" variant={pane() === value ? "outline" : "ghost"} onClick={() => setPane(value)}>
++                {language.t(
++                  value === "enhanced" ? "ui.promptEnhance.preview.enhanced" : "ui.promptEnhance.preview.original",
++                )}
++              </Button>
++            )}
++          </For>
++        </div>
++        <div class="max-h-[45vh] min-h-24 overflow-auto whitespace-pre-wrap rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 p-3 text-[13px] leading-5 text-v2-text-text-base [overflow-wrap:anywhere]">
++          <Show when={pane() === "enhanced"} fallback={props.original}>
++            {props.enhanced}
++          </Show>
++        </div>
++      </DialogBody>
++      <DialogFooter>
++        <Button variant="ghost" onClick={() => props.onChoose("cancel")}>
++          {language.t("common.cancel")}
++        </Button>
++        <Button variant="ghost" onClick={() => props.onChoose("original")}>
++          {language.t("ui.promptEnhance.preview.sendOriginal")}
++        </Button>
++        <Button variant="contrast" onClick={() => props.onChoose("enhanced")}>
++          {language.t("ui.promptEnhance.preview.sendEnhanced")}
++        </Button>
++      </DialogFooter>
++    </Dialog>
++  )
++}
+--- /dev/null
++++ b/packages/app/src/composer/editor/enhance-controls.tsx
+@@ -0,0 +1,65 @@
++import { Show } from "solid-js"
++import { Checkbox } from "@opencode/ui/checkbox"
++import { Icon } from "@opencode/ui/icon"
++import { IconButton } from "@opencode/ui/icon-button"
++import { Loader } from "@opencode/ui/loader"
++import { Tooltip } from "@opencode/ui/tooltip"
++import { useI18n } from "@opencode/ui/context/i18n"
++import { useDialog } from "@opencode/ui/context/dialog"
++import { DialogPromptEnhanceSettings } from "../enhance-dialog"
++import { promptEnhancerSettings, promptEnhancing, updatePromptEnhancerSettings } from "../enhance"
++
++/**
++ * The two ticks and the settings cog at the right of the composer toolbar. Enhance turns a
++ * rewrite on for the next send; Preview holds that rewrite for review first.
++ */
++export function ComposerEnhanceControls() {
++  const i18n = useI18n()
++  const dialog = useDialog()
++  const settings = promptEnhancerSettings
++
++  const openSettings = () => void dialog.show(() => <DialogPromptEnhanceSettings />)
++
++  return (
++    <div data-slot="composer-enhance" class="me-2 flex shrink-0 items-center gap-2">
++      <Show when={promptEnhancing()}>
++        <span
++          class="flex items-center gap-1.5 text-[11px] font-[440] leading-4 tracking-[0.05px] text-v2-text-text-muted"
++          aria-live="polite"
++        >
++          <Loader class="size-3" />
++          <span class="hidden lg:inline">{i18n.t("ui.promptEnhance.enhancing")}</span>
++        </span>
++      </Show>
++      <Tooltip placement="top" value={i18n.t("ui.promptEnhance.enable.tooltip")}>
++        <Checkbox
++          appearance="compact"
++          checked={settings().enabled}
++          onChange={(checked) => updatePromptEnhancerSettings({ enabled: checked })}
++          class="[&_[data-slot=checkbox-v2-label]]:text-[11px] [&_[data-slot=checkbox-v2-label]]:leading-4 [&_[data-slot=checkbox-v2-label]]:whitespace-nowrap"
++        >
++          {i18n.t("ui.promptEnhance.enable")}
++        </Checkbox>
++      </Tooltip>
++      <Tooltip placement="top" value={i18n.t("ui.promptEnhance.preview.tooltip")}>
++        <Checkbox
++          appearance="compact"
++          checked={settings().preview}
++          onChange={(checked) => updatePromptEnhancerSettings({ preview: checked })}
++          class="[&_[data-slot=checkbox-v2-label]]:text-[11px] [&_[data-slot=checkbox-v2-label]]:leading-4 [&_[data-slot=checkbox-v2-label]]:whitespace-nowrap"
++        >
++          {i18n.t("ui.promptEnhance.preview")}
++        </Checkbox>
++      </Tooltip>
++      <Tooltip placement="top" value={i18n.t("ui.promptEnhance.settings")}>
++        <IconButton
++          size="small"
++          variant="ghost-muted"
++          aria-label={i18n.t("ui.promptEnhance.settings")}
++          onClick={openSettings}
++          icon={<Icon name="settings-gear" size="small" />}
++        />
++      </Tooltip>
++    </div>
++  )
++}
+--- /dev/null
++++ b/packages/app/src/composer/enhance.test.ts
+@@ -0,0 +1,70 @@
++import { expect, test } from "bun:test"
++import { buildEnhancementPrompt, cleanEnhancedText, isEnhanceableText, rebuildPrompt } from "./enhance"
++import type { Prompt } from "./state"
++
++const file = {
++  type: "file" as const,
++  content: "@src/app.ts",
++  start: 6,
++  end: 17,
++  path: "src/app.ts",
++}
++
++const image = {
++  type: "image" as const,
++  id: "image-1",
++  filename: "diagram.png",
++  mime: "image/png",
++  blob: { id: "image-1", url: "" },
++}
++
++test("slash commands and blank drafts are not enhanced", () => {
++  expect(isEnhanceableText("Fix the tests")).toBe(true)
++  expect(isEnhanceableText("  /review  ")).toBe(false)
++  expect(isEnhanceableText("   ")).toBe(false)
++})
++
++test("a fenced or quoted rewrite is unwrapped", () => {
++  expect(cleanEnhancedText("```text\nFix the failing test\n```")).toBe("Fix the failing test")
++  expect(cleanEnhancedText('- "Fix the failing test"')).toBe('- "Fix the failing test"')
++  expect(cleanEnhancedText('"Fix the failing test"')).toBe("Fix the failing test")
++})
++
++test("the enhancement prompt carries the original text and instructions", () => {
++  const prompt = buildEnhancementPrompt("Fix it", "Be terse")
++
++  expect(prompt).toContain("Be terse")
++  expect(prompt).toContain("Fix it")
++})
++
++test("an agent prompt is added before the instructions", () => {
++  const prompt = buildEnhancementPrompt("Fix it", "Be terse", "You are a reviewer.")
++
++  expect(prompt.indexOf("You are a reviewer.")).toBeLessThan(prompt.indexOf("Be terse"))
++  expect(prompt).toContain("Fix it")
++})
++
++test("a rewrite keeps mentions at their new positions and preserves attachments", () => {
++  const prompt: Prompt = [
++    { type: "text", content: "Please fix ", start: 0, end: 11 },
++    file,
++    { type: "text", content: " and check it", start: 17, end: 30 },
++    image,
++  ]
++
++  const rebuilt = rebuildPrompt(prompt, "Fix @src/app.ts so the failing test passes")
++
++  expect(rebuilt.find((part) => part.type === "file")).toMatchObject({ content: "@src/app.ts", start: 4, end: 15 })
++  expect(rebuilt.find((part) => part.type === "text")?.content).toBe("Fix ")
++  expect(rebuilt.find((part) => part.type === "image")).toBe(image)
++})
++
++test("a mention the rewrite dropped is appended", () => {
++  const prompt: Prompt = [{ type: "text", content: "Check ", start: 0, end: 6 }, file]
++
++  const rebuilt = rebuildPrompt(prompt, "Review the change")
++  const text = rebuilt.map((part) => ("content" in part ? part.content : "")).join("")
++
++  expect(text).toBe("Review the change @src/app.ts")
++  expect(rebuilt.find((part) => part.type === "file")).toMatchObject({ start: 18, end: 29 })
++})
